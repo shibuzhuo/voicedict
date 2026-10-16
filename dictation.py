@@ -10,6 +10,7 @@ dictation.py —— 手机语音听写 → Ubuntu 自动上屏（服务端 + 客
 
 依赖:
     pip install fastapi uvicorn requests
+    (本机语音识别再加: pip install numpy sherpa-onnx,模型放 models/asr-zh-int8/)
 
 上屏通道(唯一):
     IBus 输入法引擎 commit_text —— 自研「语音听写」引擎(ibus_voicedict_engine.py)。
@@ -25,6 +26,7 @@ dictation.py —— 手机语音听写 → Ubuntu 自动上屏（服务端 + 客
 
 import argparse
 import json
+import os
 import queue
 import shutil
 import socket
@@ -52,6 +54,8 @@ DELAY               = 0.05     # 点「发送」→上屏的缓冲秒数（要�
 ALLOWLIST           = None     # 只允许在这些程序里自动上屏（匹配应用名/窗口标题），如 frozenset(["gnome-text-editor", "WPS", "firefox"])
 MAX_TEXT_LEN        = 20000    # 单次推送最大字数，防误发
 AUTO_SWITCH_IME     = False    # True=发送时自动切引擎(commit后切回)；False=只在你停在「语音听写」输入源时才走 commit
+LOCAL_ASR_DIR       = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "models", "asr-zh-int8")   # 本机识别模型目录,存在才启用该功能
 # ═════════════════════════════════════════════════════════════════════
 
 IS_LINUX = sys.platform.startswith("linux")
@@ -358,6 +362,17 @@ def stream(request: Request):
                                       "X-Accel-Buffering": "no"})
 
 
+@app.api_route("/local-voice", methods=["GET", "POST"])
+def local_voice(request: Request):
+    """切换本机录音识别(阶段二):快捷键或浏览器触发"""
+    if not _token_ok(request):
+        return JSONResponse({"ok": False, "error": "token 错误"}, status_code=401)
+    if not IS_LINUX:
+        return JSONResponse({"ok": False, "error": "仅支持 Linux"}, status_code=400)
+    recording, msg = _local_voice_toggle()
+    return {"ok": True, "recording": recording, "message": msg}
+
+
 def run_server(block: bool = True):
     if block:
         uvicorn.run(app, host=HOST, port=PORT, log_level="info", access_log=False)
@@ -584,10 +599,15 @@ def _deliver_linux(text: str, n: int) -> None:
             notify("语音听写：已跳过", "无法识别前台程序")
             return
 
+    _commit_with_report(text, n)
+
+
+def _commit_with_report(text: str, n: int) -> bool:
+    """走 IBus 主通道上屏,失败时按原因给出精确提示(手机/本机识别共用)"""
     st = _ibus_commit(text)
     if st == "OK":
         log(f"已 commit {n} 字（IBus 输入法通道）")
-        return
+        return True
     if st == "NOFOCUS":
         # 引擎进程在跑但没有聚焦实例。多实例状态不可靠(实例可能已销毁、
         # 进程可能重启过)，直接问 ibus 当前全局输入源——这是唯一可靠的依据
@@ -612,6 +632,131 @@ def _deliver_linux(text: str, n: int) -> None:
         log(f"上屏失败：IBus 引擎未激活（{st}）")
         log("请把输入源切到「语音听写」🎙（Super+Space），或把 AUTO_SWITCH_IME 改为 True")
         notify("语音听写失败", "请先切到「语音听写」输入源")
+    return False
+
+
+# ════════════════════════ 本机语音识别(sherpa-onnx,阶段二) ════════════════════════
+
+class _LocalVoice:
+    """快捷键触发 → pw-cat 采 16k 单声道 → 流式识别 → 再按一次结束并 commit"""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.stop_flag = False
+        self.proc = None
+        self.worker = None
+        self._rec = None
+        self._so = None
+        self._np = None
+        self.partial = ""
+
+    def _recognizer(self):
+        if self._rec is None:
+            import glob
+            import sherpa_onnx as so
+            import numpy as np
+            d = LOCAL_ASR_DIR
+            pick = lambda pat: glob.glob(os.path.join(d, pat))[0]
+            self._rec = so.OnlineRecognizer.from_transducer(
+                tokens=os.path.join(d, "tokens.txt"),
+                encoder=pick("encoder*.onnx"),
+                decoder=pick("decoder*.onnx"),
+                joiner=pick("joiner*.onnx"),
+                num_threads=2,             # 双核 CPU
+                decoding_method="greedy_search",
+            )
+            self._so, self._np = so, np
+            log("识别模型已加载(首次触发后常驻)")
+        return self._rec
+
+    def toggle(self):
+        with self.lock:
+            if self.worker and self.worker.is_alive():
+                self.stop_flag = True
+                return False, "结束录音，识别中…"
+            if not os.path.isdir(LOCAL_ASR_DIR):
+                return False, f"本机识别未启用(缺模型目录 {LOCAL_ASR_DIR})"
+            try:
+                self._recognizer()
+            except Exception as e:
+                log(f"识别模型加载失败: {e}")
+                return False, f"模型加载失败: {e}"
+            self.stop_flag = False
+            self.partial = ""
+            self.worker = threading.Thread(target=self._run, daemon=True,
+                                           name="local-voice")
+            self.worker.start()
+            return True, "开始录音，再按一次结束"
+
+    def _run(self):
+        np, so, rec = self._np, self._so, self._rec
+        stream = rec.create_stream()
+        try:
+            self.proc = subprocess.Popen(
+                ["pw-cat", "-r", "--rate", "16000", "--channels", "1",
+                 "--format", "s16", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            log(f"启动采集失败: {e}")
+            return
+        log("🎙 本机录音中…(再触发一次结束)")
+        notify("语音听写 🎙", "录音中，再按一次结束")
+        try:
+            while not self.stop_flag:
+                data = self.proc.stdout.read(3200)   # 0.1s 的 s16 单声道
+                if not data:
+                    break
+                samples = np.frombuffer(data, dtype=np.int16) \
+                    .astype(np.float32) / 32768.0
+                stream.accept_waveform(16000, samples)
+                while rec.is_ready(stream):
+                    rec.decode_stream(stream)
+                text = rec.get_result(stream)
+                if text and text != self.partial:
+                    self.partial = text
+                    log(f"  识别中: {text}")
+        finally:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        try:
+            stream.input_finished()
+            while rec.is_ready(stream):
+                rec.decode_stream(stream)
+            text = rec.get_result(stream) or self.partial
+        except Exception:
+            text = self.partial
+        text = (text or "").replace(" ", "").strip()
+        if text:
+            log(f"识别完成: {text}")
+            _commit_with_report(text, len(text))
+        else:
+            log("没听清(无有效语音)")
+            notify("语音听写", "没听清，再试一次？")
+
+
+_local_voice = None
+
+def _ensure_local_voice():
+    global _local_voice
+    if _local_voice is None:
+        _local_voice = _LocalVoice()
+    return _local_voice
+
+
+def _preload_asr():
+    """服务启动时后台加载模型,首次按键零等待"""
+    try:
+        _ensure_local_voice()._recognizer()
+        log("识别模型预加载完成,快捷键即时可用")
+    except Exception as e:
+        log(f"识别模型预加载失败: {e}")
+
+
+def _local_voice_toggle():
+    """供 /local-voice 端点调用;返回 (是否在录音, 提示)"""
+    return _ensure_local_voice().toggle()
 
 
 _http = requests.Session()
@@ -621,6 +766,12 @@ _http.trust_env = False   # 无视系统代理，避免本机回环连接被代�
 def client_loop() -> None:
     if IS_LINUX:
         log(f"上屏通道: {_linux_backend_summary()}")
+        if os.path.isdir(LOCAL_ASR_DIR):
+            log("本机识别: 模型就绪(快捷键或 /local-voice 触发)")
+            threading.Thread(target=_preload_asr, daemon=True,
+                             name="asr-preload").start()
+        else:
+            log("本机识别: 未装模型,仅手机通道")
     else:
         log("警告：当前不是 Linux，无法上屏，仅接收显示")
     log(f"客户端就绪，正在连接 {URL}/stream")

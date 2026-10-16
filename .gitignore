@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 1.txt
 *.log
+models/
