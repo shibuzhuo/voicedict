@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  语音听写 IBus 引擎组件模板
+  install.sh 会把 @ENGINE_DIR@ 替换为仓库实际路径后安装到
+  ~/.local/share/ibus/component/voicedict.xml
+-->
+<component>
+	<name>com.voicedict.component</name>
+	<description>语音听写：手机语音 → commit_text 直接上屏</description>
+	<exec>@ENGINE_DIR@/ibus_voicedict_engine.py --ibus</exec>
+	<version>1.0</version>
+	<author>voicedict contributors</author>
+	<license>MIT</license>
+	<homepage>https://gitcode.com/a5671550/voicedict</homepage>
+	<textdomain>voicedict</textdomain>
+	<engines>
+		<engine>
+			<name>voicedict</name>
+			<language>zh_CN</language>
+			<license>MIT</license>
+			<author>voicedict contributors</author>
+			<icon>audio-input-microphone</icon>
+			<layout>default</layout>
+			<layout_variant></layout_variant>
+			<layout_option></layout_option>
+			<longname>语音听写</longname>
+			<description>手机语音听写 → IBus commit_text 上屏</description>
+			<rank>1</rank>
+			<symbol>🎙</symbol>
+			<setup></setup>
+			<hotkeys></hotkeys>
+			<version>1.0</version>
+		</engine>
+	</engines>
+</component>
