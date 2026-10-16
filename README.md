@@ -60,7 +60,12 @@ ALLOWLIST        = None           # 只允许在指定程序上屏,如 frozenset
 MAX_TEXT_LEN     = 20000          # 单次推送上限
 AUTO_SWITCH_IME  = False          # True=发送时自动切引擎 commit 后切回
 LOCAL_ASR_DIR    = .../models/asr-zh-int8   # 本机识别模型目录,存在才启用
+USE_DENOISER     = False          # GTCRN 降噪(实验性):实测部分内置麦克风会把语音一起压没,默认关
+MIC_HW_VOLUME    = "40%"          # 录音前强制的硬件增益(实测本机:40%干净/45-60%死区/100%削波)
 ```
+
+排查"没听清":每次录音自动转储 `/tmp/voicedict_last_raw.wav`(原始)和
+`/tmp/voicedict_last_dn.wav`(降噪后),直接 pw-play 听或喂 ASR 对比。
 
 改完 `systemctl --user restart dictation` 生效。
 
@@ -99,5 +104,5 @@ tail -f /tmp/voicedict_engine.log          # IBus 引擎日志
 ## 后续想法
 
 - 静音自动停止(is_endpoint 检测,免按第二次)
-- RNNoise 实时降噪接入 PipeWire(老笔记本底噪大)
 - 手机网页直接调用电脑麦克风(统一两条路径)
+- 降噪换更适合内置麦克风的方案(GTCRN 实测会连语音一起压掉,已默认关闭)

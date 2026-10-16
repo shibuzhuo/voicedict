@@ -56,6 +56,10 @@ MAX_TEXT_LEN        = 20000    # 单次推送最大字数，防误发
 AUTO_SWITCH_IME     = False    # True=发送时自动切引擎(commit后切回)；False=只在你停在「语音听写」输入源时才走 commit
 LOCAL_ASR_DIR       = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "models", "asr-zh-int8")   # 本机识别模型目录,存在才启用该功能
+LOCAL_DENOISER      = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "models", "denoiser", "gtcrn.onnx")   # 降噪模型,存在则识别前自动降噪
+USE_DENOISER        = False    # GTCRN 降噪。实测本机麦克风上会把语音一起压没,默认关;模型留着备选
+MIC_HW_VOLUME       = "40%"    # 录音前强制的硬件增益(实测:40%干净,45-60%死区,100%削波);None=不管理
 # ═════════════════════════════════════════════════════════════════════
 
 IS_LINUX = sys.platform.startswith("linux")
@@ -648,6 +652,7 @@ class _LocalVoice:
         self._rec = None
         self._so = None
         self._np = None
+        self._dn = None
         self.partial = ""
 
     def _recognizer(self):
@@ -668,6 +673,25 @@ class _LocalVoice:
             self._so, self._np = so, np
             log("识别模型已加载(首次触发后常驻)")
         return self._rec
+
+    def _denoiser(self):
+        """GTCRN 神经网络降噪;模型缺失/加载失败则原样直通(三态:None未试/False失败/对象)"""
+        if not USE_DENOISER:
+            return None
+        if self._dn is None:
+            if not os.path.isfile(LOCAL_DENOISER):
+                self._dn = False
+            else:
+                try:
+                    so = self._so or __import__("sherpa_onnx")
+                    g = so.OfflineSpeechDenoiserGtcrnModelConfig(model=LOCAL_DENOISER)
+                    self._dn = so.OnlineSpeechDenoiser(so.OnlineSpeechDenoiserConfig(
+                        model=so.OfflineSpeechDenoiserModelConfig(gtcrn=g)))
+                    log("降噪器已就绪(GTCRN,识别前自动降噪)")
+                except Exception as e:
+                    log(f"降噪器加载失败,本次不降噪: {e}")
+                    self._dn = False
+        return self._dn or None
 
     def toggle(self):
         with self.lock:
@@ -690,7 +714,18 @@ class _LocalVoice:
 
     def _run(self):
         np, so, rec = self._np, self._so, self._rec
+        dn = self._denoiser()
+        if dn is not None:
+            dn.reset()   # 每次录音从干净状态开始
         stream = rec.create_stream()
+        raw_buf, dn_buf = [], []   # 调试转储:原始/降噪后音频
+        # 硬件增益自愈:WirePlumber 偶发把它顶回 100% 导致削波,每次录音前强制拉回
+        if MIC_HW_VOLUME and shutil.which("amixer"):
+            try:
+                subprocess.run(["amixer", "-c", "0", "sset", "Capture", "0",
+                                MIC_HW_VOLUME], capture_output=True, timeout=3)
+            except Exception:
+                pass
         try:
             self.proc = subprocess.Popen(
                 ["pw-cat", "-r", "--rate", "16000", "--channels", "1",
@@ -699,7 +734,7 @@ class _LocalVoice:
         except Exception as e:
             log(f"启动采集失败: {e}")
             return
-        log("🎙 本机录音中…(再触发一次结束)")
+        log("🎙 本机录音中…(再触发一次结束)" + (" [已降噪]" if dn else ""))
         notify("语音听写 🎙", "录音中，再按一次结束")
         try:
             while not self.stop_flag:
@@ -708,6 +743,13 @@ class _LocalVoice:
                     break
                 samples = np.frombuffer(data, dtype=np.int16) \
                     .astype(np.float32) / 32768.0
+                raw_buf.append(samples.copy())
+                if dn is not None:
+                    samples = np.asarray(dn.run(samples, 16000).samples,
+                                         dtype=np.float32)
+                    if len(samples) == 0:
+                        continue   # 降噪器内部攒帧,这次没吐出数据
+                dn_buf.append(samples.copy())
                 stream.accept_waveform(16000, samples)
                 while rec.is_ready(stream):
                     rec.decode_stream(stream)
@@ -720,7 +762,23 @@ class _LocalVoice:
                 self.proc.kill()
             except Exception:
                 pass
+        # 调试转储:留最近一次的原始/降噪音频,排查"没听清"用
         try:
+            import wave as _wave
+            for tag, buf in (("raw", raw_buf), ("dn", dn_buf)):
+                if buf:
+                    pcm = np.clip(np.concatenate(buf) * 32767, -32767, 32767) \
+                        .astype("<i2")
+                    with _wave.open(f"/tmp/voicedict_last_{tag}.wav", "wb") as w:
+                        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+                        w.writeframes(pcm.tobytes())
+        except Exception:
+            pass
+        try:
+            if dn is not None:
+                tail = np.asarray(dn.flush().samples, dtype=np.float32)
+                if len(tail):
+                    stream.accept_waveform(16000, tail)
             stream.input_finished()
             while rec.is_ready(stream):
                 rec.decode_stream(stream)
@@ -748,7 +806,10 @@ def _ensure_local_voice():
 def _preload_asr():
     """服务启动时后台加载模型,首次按键零等待"""
     try:
-        _ensure_local_voice()._recognizer()
+        lv = _ensure_local_voice()
+        lv._recognizer()
+        if USE_DENOISER and os.path.isfile(LOCAL_DENOISER):
+            lv._denoiser()
         log("识别模型预加载完成,快捷键即时可用")
     except Exception as e:
         log(f"识别模型预加载失败: {e}")
@@ -767,7 +828,8 @@ def client_loop() -> None:
     if IS_LINUX:
         log(f"上屏通道: {_linux_backend_summary()}")
         if os.path.isdir(LOCAL_ASR_DIR):
-            log("本机识别: 模型就绪(快捷键或 /local-voice 触发)")
+            dn = " +降噪" if (USE_DENOISER and os.path.isfile(LOCAL_DENOISER)) else ""
+            log(f"本机识别: 模型就绪{dn}(快捷键或 /local-voice 触发)")
             threading.Thread(target=_preload_asr, daemon=True,
                              name="asr-preload").start()
         else:
