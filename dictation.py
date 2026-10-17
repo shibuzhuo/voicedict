@@ -54,11 +54,8 @@ DELAY               = 0.05     # 点「发送」→上屏的缓冲秒数（要�
 ALLOWLIST           = None     # 只允许在这些程序里自动上屏（匹配应用名/窗口标题），如 frozenset(["gnome-text-editor", "WPS", "firefox"])
 MAX_TEXT_LEN        = 20000    # 单次推送最大字数，防误发
 AUTO_SWITCH_IME     = False    # True=发送时自动切引擎(commit后切回)；False=只在你停在「语音听写」输入源时才走 commit
-LOCAL_ZIPFORMER_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "models", "asr-zh-int8")     # 流式引擎:边说边出字,轻量
 LOCAL_SENSEVOICE_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "models", "asr-sensevoice")  # 非流式引擎:说完出字,更准更快
-LOCAL_ASR_ENGINE      = "sensevoice"   # "sensevoice"(默认,准确率高) 或 "zipformer"(流式)
+                                   "models", "asr-sensevoice")  # 本机识别模型(SenseVoice,非流式)
 LOCAL_DENOISER      = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "models", "denoiser", "gtcrn.onnx")   # 降噪模型,存在则识别前自动降噪
 USE_DENOISER        = False    # GTCRN 降噪。实测本机麦克风上会把语音一起压没,默认关;模型留着备选
@@ -656,8 +653,6 @@ class _LocalVoice:
         self._so = None
         self._np = None
         self._dn = None
-        self._engine = None
-        self.partial = ""
 
     def _recognizer(self):
         if self._rec is None:
@@ -665,27 +660,12 @@ class _LocalVoice:
             import sherpa_onnx as so
             import numpy as np
             self._so, self._np = so, np
-            if LOCAL_ASR_ENGINE == "sensevoice" and os.path.isdir(LOCAL_SENSEVOICE_DIR):
-                pick = lambda pat: glob.glob(os.path.join(LOCAL_SENSEVOICE_DIR, pat))[0]
-                self._rec = so.OfflineRecognizer.from_sense_voice(
-                    model=pick("model*.onnx"),
-                    tokens=os.path.join(LOCAL_SENSEVOICE_DIR, "tokens.txt"),
-                    num_threads=2, use_itn=True, language="zh")
-                self._engine = "sensevoice"
-                log("识别引擎: SenseVoice(非流式,准确率优先)")
-            else:
-                d = LOCAL_ZIPFORMER_DIR
-                pick = lambda pat: glob.glob(os.path.join(d, pat))[0]
-                self._rec = so.OnlineRecognizer.from_transducer(
-                    tokens=os.path.join(d, "tokens.txt"),
-                    encoder=pick("encoder*.onnx"),
-                    decoder=pick("decoder*.onnx"),
-                    joiner=pick("joiner*.onnx"),
-                    num_threads=2,             # 双核 CPU
-                    decoding_method="greedy_search",
-                )
-                self._engine = "zipformer"
-                log("识别引擎: zipformer(流式)")
+            pick = lambda pat: glob.glob(os.path.join(LOCAL_SENSEVOICE_DIR, pat))[0]
+            self._rec = so.OfflineRecognizer.from_sense_voice(
+                model=pick("model*.onnx"),
+                tokens=os.path.join(LOCAL_SENSEVOICE_DIR, "tokens.txt"),
+                num_threads=2, use_itn=True, language="zh")
+            log("识别引擎: SenseVoice(已加载,常驻)")
         return self._rec
 
     def _denoiser(self):
@@ -712,17 +692,14 @@ class _LocalVoice:
             if self.worker and self.worker.is_alive():
                 self.stop_flag = True
                 return False, "结束录音，识别中…"
-            d = LOCAL_SENSEVOICE_DIR if LOCAL_ASR_ENGINE == "sensevoice" \
-                else LOCAL_ZIPFORMER_DIR
-            if not os.path.isdir(d):
-                return False, f"本机识别未启用(缺模型目录 {d})"
+            if not os.path.isdir(LOCAL_SENSEVOICE_DIR):
+                return False, f"本机识别未启用(缺模型目录 {LOCAL_SENSEVOICE_DIR})"
             try:
                 self._recognizer()
             except Exception as e:
                 log(f"识别模型加载失败: {e}")
                 return False, f"模型加载失败: {e}"
             self.stop_flag = False
-            self.partial = ""
             self.worker = threading.Thread(target=self._run, daemon=True,
                                            name="local-voice")
             self.worker.start()
@@ -733,7 +710,6 @@ class _LocalVoice:
         dn = self._denoiser()
         if dn is not None:
             dn.reset()   # 每次录音从干净状态开始
-        stream = rec.create_stream()
         raw_buf, dn_buf = [], []   # 调试转储:原始/降噪后音频
         # 硬件增益自愈:WirePlumber 偶发把它顶回 100% 导致削波,每次录音前强制拉回
         if MIC_HW_VOLUME and shutil.which("amixer"):
@@ -766,14 +742,6 @@ class _LocalVoice:
                     if len(samples) == 0:
                         continue   # 降噪器内部攒帧,这次没吐出数据
                 dn_buf.append(samples.copy())
-                if self._engine == "zipformer":
-                    stream.accept_waveform(16000, samples)
-                    while rec.is_ready(stream):
-                        rec.decode_stream(stream)
-                    text = rec.get_result(stream)
-                    if text and text != self.partial:
-                        self.partial = text
-                        log(f"  识别中: {text}")
         finally:
             try:
                 self.proc.kill()
@@ -791,33 +759,20 @@ class _LocalVoice:
                         w.writeframes(pcm.tobytes())
         except Exception:
             pass
-        if self._engine == "sensevoice":
-            # 非流式:整段音频一次性解码(实测约 0.15x 实时,10 秒话音约 1.5 秒)
-            text = ""
-            try:
-                log("识别中…")
-                if dn is not None:
-                    tail = np.asarray(dn.flush().samples, dtype=np.float32)
-                    if len(tail):
-                        dn_buf.append(tail)
-                st = rec.create_stream()
-                st.accept_waveform(16000, np.concatenate(dn_buf or raw_buf))
-                rec.decode_stream(st)
-                text = st.result.text
-            except Exception as e:
-                log(f"SenseVoice 解码失败: {e}")
-        else:
-            try:
-                if dn is not None:
-                    tail = np.asarray(dn.flush().samples, dtype=np.float32)
-                    if len(tail):
-                        stream.accept_waveform(16000, tail)
-                stream.input_finished()
-                while rec.is_ready(stream):
-                    rec.decode_stream(stream)
-                text = rec.get_result(stream) or self.partial
-            except Exception:
-                text = self.partial
+        # 非流式:整段音频一次性解码(实测约 0.15x 实时,10 秒话音约 1.5 秒)
+        text = ""
+        try:
+            log("识别中…")
+            if dn is not None:
+                tail = np.asarray(dn.flush().samples, dtype=np.float32)
+                if len(tail):
+                    dn_buf.append(tail)
+            st = rec.create_stream()
+            st.accept_waveform(16000, np.concatenate(dn_buf or raw_buf))
+            rec.decode_stream(st)
+            text = st.result.text
+        except Exception as e:
+            log(f"SenseVoice 解码失败: {e}")
         text = (text or "").replace(" ", "").strip()
         if text:
             log(f"识别完成: {text}")
@@ -860,9 +815,7 @@ _http.trust_env = False   # 无视系统代理，避免本机回环连接被代�
 def client_loop() -> None:
     if IS_LINUX:
         log(f"上屏通道: {_linux_backend_summary()}")
-        _d = LOCAL_SENSEVOICE_DIR if LOCAL_ASR_ENGINE == "sensevoice" \
-            else LOCAL_ZIPFORMER_DIR
-        if os.path.isdir(_d):
+        if os.path.isdir(LOCAL_SENSEVOICE_DIR):
             dn = " +降噪" if (USE_DENOISER and os.path.isfile(LOCAL_DENOISER)) else ""
             log(f"本机识别: 模型就绪{dn}(快捷键或 /local-voice 触发)")
             threading.Thread(target=_preload_asr, daemon=True,

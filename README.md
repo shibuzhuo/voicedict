@@ -32,16 +32,12 @@ cd voicedict && ./install.sh
 ```bash
 pip install --user --break-system-packages numpy sherpa-onnx   # 清华镜像加 -i https://pypi.tuna.tsinghua.edu.cn/simple
 mkdir -p models && cd models
-# 默认引擎 SenseVoice(非流式,准确率高,233MB)
 wget https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2
 tar xjf *.tar.bz2 && mv sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09 asr-sensevoice && rm *.tar.bz2
-# 备选流式引擎 zipformer(边说边出字,161MB,精度较低)
-wget https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30.tar.bz2
-tar xjf *zipformer*.tar.bz2 && mv sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30 asr-zh-int8 && rm *.tar.bz2
 cd .. && systemctl --user restart dictation   # 启动时后台预加载模型
 ```
 
-双核 i3 上 SenseVoice 解码约 0.15x 实时(10 秒话音约 1.5 秒出字)。
+模型 233MB(SenseVoice-Small int8),双核 i3 解码约 0.15x 实时(10 秒话音约 1.5 秒出字)。
 没装模型时仅手机通道可用,不影响运行。
 
 ## 使用
@@ -64,8 +60,7 @@ DELAY            = 0.05           # 发送→上屏缓冲秒数
 ALLOWLIST        = None           # 只允许在指定程序上屏,如 frozenset(["firefox"])
 MAX_TEXT_LEN     = 20000          # 单次推送上限
 AUTO_SWITCH_IME  = False          # True=发送时自动切引擎 commit 后切回
-LOCAL_ZIPFORMER_DIR/LOCAL_SENSEVOICE_DIR = .../models/  # 两套识别模型的目录,存在才启用
-LOCAL_ASR_ENGINE  = "sensevoice"  # "sensevoice"=更准(默认) / "zipformer"=流式边说边出字
+LOCAL_SENSEVOICE_DIR = .../models/asr-sensevoice   # 识别模型目录,存在才启用
 USE_DENOISER     = False          # GTCRN 降噪(实验性):实测部分内置麦克风会把语音一起压没,默认关
 MIC_HW_VOLUME    = "40%"          # 录音前强制的硬件增益(实测本机:40%干净/45-60%死区/100%削波)
 ```
