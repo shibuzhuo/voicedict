@@ -64,28 +64,9 @@ MIC_HW_VOLUME       = "40%"    # 录音前强制的硬件增益(实测:40%干净
 
 IS_LINUX = sys.platform.startswith("linux")
 
-try:
-    from plyer import notification as _plyer
-except Exception:
-    _plyer = None
-
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-
-
-def notify(title: str, message: str) -> None:
-    if _plyer is not None:
-        try:
-            _plyer.notify(title=title, message=message, timeout=3)
-            return
-        except Exception:
-            pass
-    if IS_LINUX and shutil.which("notify-send"):
-        try:
-            subprocess.run(["notify-send", title, message], check=False, timeout=5)
-        except Exception:
-            pass
 
 
 # ════════════════════════ 进程内消息总线 ════════════════════════
@@ -596,11 +577,9 @@ def _deliver_linux(text: str, n: int) -> None:
                 hay = f"{app} {title}".lower()
                 if not any(str(x).lower() in hay for x in ALLOWLIST):
                     log(f"前台 {app or '?'} 不在 ALLOWLIST 白名单内，已跳过上屏")
-                    notify("语音听写：已跳过", "前台程序不在白名单内")
                     return
         elif ALLOWLIST is not None:
             log("识别不到当前焦点，ALLOWLIST 模式下保守跳过")
-            notify("语音听写：已跳过", "无法识别前台程序")
             return
 
     _commit_with_report(text, n)
@@ -624,18 +603,14 @@ def _commit_with_report(text: str, n: int) -> bool:
         if cur == _IBUS_ENGINE:
             log("上屏失败：当前没有聚焦的输入框")
             log("点一下要输入的位置再发送（输入源已是「语音听写」🎙）")
-            notify("语音听写失败", "请先点一下输入位置")
         else:
             log(f"上屏失败：当前输入源是 {cur or '?'}，不是「语音听写」")
             log("请切回「语音听写」🎙（Super+Space），或把 AUTO_SWITCH_IME 改为 True")
-            notify("语音听写失败", "请先切到「语音听写」输入源")
     elif st == "FAIL":
         log("上屏失败：引擎 commit 异常")
-        notify("语音听写失败", "引擎 commit 失败")
     else:
         log(f"上屏失败：IBus 引擎未激活（{st}）")
         log("请把输入源切到「语音听写」🎙（Super+Space），或把 AUTO_SWITCH_IME 改为 True")
-        notify("语音听写失败", "请先切到「语音听写」输入源")
     return False
 
 
@@ -727,7 +702,6 @@ class _LocalVoice:
             log(f"启动采集失败: {e}")
             return
         log("🎙 本机录音中…(再触发一次结束)" + (" [已降噪]" if dn else ""))
-        notify("语音听写 🎙", "录音中，再按一次结束")
         try:
             while not self.stop_flag:
                 data = self.proc.stdout.read(3200)   # 0.1s 的 s16 单声道
@@ -779,7 +753,6 @@ class _LocalVoice:
             _commit_with_report(text, len(text))
         else:
             log("没听清(无有效语音)")
-            notify("语音听写", "没听清，再试一次？")
 
 
 _local_voice = None

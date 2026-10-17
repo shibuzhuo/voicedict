@@ -56,14 +56,14 @@ else:
     print("输入源已存在")
 PYEOF
 
-# 注册 F10 本机语音快捷键
+# 注册 Alt+V 本机语音快捷键
 KB=/org/gnome/settings-daemon/plugins/media-keys
 TOKEN_VALUE=$(grep -m1 '^TOKEN' "$DIR/dictation.py" | cut -d'"' -f2)
 gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "['$KB/custom0/']"
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KB/custom0/ name '语音听写(本机)'
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KB/custom0/ command "wget -q -O /dev/null 'http://127.0.0.1:8765/local-voice?token=$TOKEN_VALUE'"
-gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KB/custom0/ binding 'F10'
-echo "已注册快捷键 F10(本机语音识别)"
+gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KB/custom0/ binding '<Alt>v'
+echo "已注册快捷键 Alt+V(本机语音识别)"
 
 # 刷新组件缓存并重启相关服务
 rm -f "$HOME/.cache/ibus/bus/registry"
