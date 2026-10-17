@@ -1,107 +1,78 @@
-# 🎙 语音听写 —— 手机说话或本机说话,Ubuntu 上屏
+# 🎙 语音听写 —— 手机/本机说话,Ubuntu 光标处上屏
 
-两条输入路径,同一个上屏通道:
-- **手机**:用手机输入法的语音识别说话,浏览器发送
-- **本机**:按 **Alt+V** 直接对电脑说话,sherpa-onnx 本地离线识别
+对着手机或电脑说中文,文字直接落到**当前光标位置**——终端、编辑器、浏览器、聊天框都行。
+中文标点、换行、emoji 无损;不模拟按键、不占剪贴板、断网可用。
 
-文字自动落到**当前光标所在的位置**。中文、全角标点、换行、emoji 全部无损;
-不模拟按键、不占剪贴板、断网可用。
+## 功能一览
 
-```
-手机浏览器(http://<电脑IP>:8765) ──┐
-                                    ├→ dictation.py ──→ IBus「语音听写」引擎
-Alt+V → 麦克风 → sherpa-onnx 识别 ──┘      (网页+推送+调度)   → commit_text 落到光标
-```
+- **本机语音**:按 Alt+V → 说话 → 再按 Alt+V,SenseVoice 本地离线识别,说完约 1 秒出字
+- **手机语音**:手机浏览器说话 → 点「发送」,约 0.15 秒上屏(借用手机输入法的语音识别)
+- 双通道共用上屏引擎:自研 IBus 输入法,commit 直达光标
+- 开机自启(systemd 用户服务),全程无 root 运行
 
-**原理**:键盘键码层面没有中文,"远程键盘"打不出中文;所以只传字符串,
-上屏走输入法的 commit 通道(输入法第⑤层),而不是模拟按键。全程纯用户态。
+## 适合谁
+
+- 不想打字:对着电脑口述长文,说到哪落到哪
+- 用语音起草初稿,再手动润色
+- 手机语音输入顺手,但往电脑传字麻烦:手机直接当语音外设
 
 ## 安装
+
+前置:Ubuntu 22.04/24.04 + GNOME;需已装 pip(24.04 默认没有,
+`sudo apt install python3-pip` 是唯一用到 root 的一步)。
 
 ```bash
 git clone https://gitcode.com/a5671550/voicedict.git
 cd voicedict && ./install.sh
 ```
 
-前置:系统需已安装 pip(Ubuntu 24.04 默认没有:`sudo apt install python3-pip`,
-这是唯一可能用到 root 的一步)。脚本自动完成:装 Python 依赖 → 注册 IBus 引擎 →
-创建 systemd 用户服务(开机自启)→ 添加「语音听写」输入源 → 注册 Alt+V 快捷键。
+脚本自动完成:装 Python 依赖 → 注册 IBus 引擎 → 建自启服务 →
+添加「语音听写」输入源 → 绑定 Alt+V 快捷键。
 
-**本机语音识别**(可选)需另装模型:
+**启用本机语音**(可选,另下载 233MB 模型):
 
 ```bash
-pip install --user --break-system-packages numpy sherpa-onnx   # 清华镜像加 -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install --user --break-system-packages numpy sherpa-onnx   # 加 -i https://pypi.tuna.tsinghua.edu.cn/simple 走清华镜像
 mkdir -p models && cd models
 wget https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2
 tar xjf *.tar.bz2 && mv sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09 asr-sensevoice && rm *.tar.bz2
-cd .. && systemctl --user restart dictation   # 启动时后台预加载模型
+cd .. && systemctl --user restart dictation
 ```
-
-模型 233MB(SenseVoice-Small int8),双核 i3 解码约 0.15x 实时(10 秒话音约 1.5 秒出字)。
-没装模型时仅手机通道可用,不影响运行。
 
 ## 使用
 
-**本机语音(推荐)**:
-1. 输入源切到「语音听写」🎙 并常驻(引擎对键盘透传,打字不受影响)
+**本机语音(日常推荐)**
+1. Super+Space 切到「语音听写」🎙 输入源并常驻(引擎对键盘透传,正常打字不受影响)
 2. 光标点进任意输入位置
-3. 按 **Alt+V** → 说话 → 再按 Alt+V → 文字落屏(过程看日志:`journalctl --user -u dictation -f`)
+3. **Alt+V → 说话 → 再按 Alt+V** → 文字落屏
 
-**手机**:浏览器打开 `http://<电脑IP>:8765` → 语音说话 → 点「发送」→ 约 150ms 落屏。
-建议"添加到主屏幕"。
+**手机语音**
+1. 手机浏览器打开 `http://<电脑IP>:8765`,建议"添加到主屏幕"
+2. 用输入法的语音识别说话 → 点「发送」→ 文字落屏
 
 没停在「语音听写」输入源时发送,日志会提示该切输入源还是点输入框。
 
-## 配置(`dictation.py` 顶部)
+## 配置与运维
 
-```python
-TOKEN            = "mysecret123"  # 防局域网乱入,随手改(改后重跑 install.sh 更新快捷键)
-DELAY            = 0.05           # 发送→上屏缓冲秒数
-ALLOWLIST        = None           # 只允许在指定程序上屏,如 frozenset(["firefox"])
-MAX_TEXT_LEN     = 20000          # 单次推送上限
-AUTO_SWITCH_IME  = False          # True=发送时自动切引擎 commit 后切回
-LOCAL_SENSEVOICE_DIR = .../models/asr-sensevoice   # 识别模型目录,存在才启用
-MIC_HW_VOLUME    = "40%"          # 录音前强制的硬件增益(实测本机:40%干净/45-60%死区/100%削波)
-```
+`dictation.py` 顶部配置区,常用项:
 
-排查"没听清":每次录音自动转储 `/tmp/voicedict_last.wav`,pw-play 试听确认采集正常。
-
-改完 `systemctl --user restart dictation` 生效。
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `TOKEN` | mysecret123 | 防局域网乱入;改后重跑 install.sh 更新快捷键里的令牌 |
+| `DELAY` | 0.05 | 手机发送→上屏的缓冲秒数 |
+| `ALLOWLIST` | None | 只允许在指定程序上屏,如 `frozenset(["firefox"])` |
+| `AUTO_SWITCH_IME` | False | True=发送时自动切引擎 commit 后切回 |
+| `MIC_HW_VOLUME` | 40% | 内置麦克风录音增益(自动管理,蓝牙麦不受影响) |
 
 ```bash
-journalctl --user -u dictation -f          # 实时日志(识别过程可见)
+journalctl --user -u dictation -f          # 实时日志
+systemctl --user restart dictation         # 改配置后重启生效
 systemctl --user disable --now dictation   # 彻底停用
-tail -f /tmp/voicedict_engine.log          # IBus 引擎日志
 ```
 
-## 文件
+排查"没听清":`/tmp/voicedict_last.wav` 是最近一次本机录音,`pw-play` 试听即可确认采集。
 
-| 文件 | 作用 |
-|---|---|
-| `dictation.py` | 主程序:网页+推送+本机识别+上屏调度 |
-| `ibus_voicedict_engine.py` | IBus 引擎,被 ibus-daemon 按需拉起,收字符串即 commit |
-| `voicedict.xml.in` | 引擎注册模板 |
-| `install.sh` | 一键安装 |
+## 原理一句话
 
-## 踩坑实录(精要)
-
-- 引擎必须在总线上 `request_name` 认领组件名,ibus-daemon 才认为就绪,
-  否则 `SetGlobalEngine` 一直超时——对照 ibus-table 源码才发现,文档无记载
-- ibus-daemon 默认不扫 `~/.local/share/ibus/component/`,需 systemd drop-in 注入
-  `IBUS_COMPONENT_PATH`,且改完要删 `~/.cache/ibus/bus/registry` 再重启
-- 程序化切换输入法只能走 `ibus engine <name>`:GNOME 吞合成 Super 键,
-  改 gsettings 也被忽略
-- GNOME 自定义快捷键**不能绑单独的修饰键**(如右 Alt),必须带普通键
-- ibus-daemon 对引擎的 stderr 是黑洞,引擎日志必须写文件
-- 组件 XML 字段不全会产生 NULL 警告甚至被 GNOME 拒绝激活,对照 libpinyin.xml 补齐
-- gnome-terminal 是原生 Wayland + 只读无障碍接口,终端上屏正解就是 IBus commit
-- AT-SPI 全树扫描可达数百毫秒,commit 快路径只查监听缓存(毫秒级)
-- sherpa-onnx 1.13+ 改用 `OnlineRecognizer.from_transducer()` 工厂方法,
-  旧版 `OnlineRecognizerTransducerConfig` 已移除
-- 内置麦克风每次录音开头约 1.5 秒上电冲击噪声,增益调低+数字放大可压底噪
-
-## 后续想法
-
-- 静音自动停止(is_endpoint 检测,免按第二次)
-- 手机网页直接调用电脑麦克风(统一两条路径)
-- 降噪换更适合内置麦克风的方案(GTCRN 实测会连语音一起压掉,已默认关闭)
+键盘键码层没有中文,"远程键盘"打不出中文;本项目只传字符串,上屏走输入法的
+commit 通道,PipeWire 采集 + sherpa-onnx 离线识别,全程用户态。
