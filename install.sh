@@ -8,8 +8,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 ENGINE_NAME="voicedict"
 
 echo "==> 1/4 安装 Python 依赖（用户级）"
-pip install --user fastapi uvicorn requests 2>/dev/null || \
-  pip install --user --break-system-packages fastapi uvicorn requests
+pip install --user fastapi uvicorn 2>/dev/null || \
+  pip install --user --break-system-packages fastapi uvicorn
 
 echo "==> 2/4 注册 IBus 引擎组件"
 mkdir -p "$HOME/.local/share/ibus/component"

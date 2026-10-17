@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-dictation.py —— 手机语音听写 → Ubuntu 自动上屏（服务端 + 客户端 + 网页 三合一）
+dictation.py —— 语音听写 → Ubuntu 上屏(网页服务 + 本机识别 + IBus 上屏)
 
 用法:
-    python dictation.py                 # 默认: 服务端 + 客户端一起跑
-    python dictation.py --server-only   # 只起网页/推送服务(排查用)
-    python dictation.py --client-only   # 只收消息并上屏(排查用)
+    python3 dictation.py            # 通常由 systemd 用户服务运行;前台调试直接跑
 
 依赖:
-    pip install fastapi uvicorn requests
-    (本机语音识别再加: pip install numpy sherpa-onnx,模型放 models/asr-zh-int8/)
+    pip install fastapi uvicorn
+    (本机语音识别再加: pip install numpy sherpa-onnx,模型放 models/asr-sensevoice/)
+
+两条输入路径:
+    手机: 浏览器打开 http://<电脑IP>:8765 → 输入法语音说话 → 点「发送」
+    本机: 按 Alt+V → 说话 → 再按 Alt+V(SenseVoice 离线识别,说完出字)
 
 上屏通道(唯一):
     IBus 输入法引擎 commit_text —— 自研「语音听写」引擎(ibus_voicedict_engine.py)。
@@ -18,13 +20,9 @@ dictation.py —— 手机语音听写 → Ubuntu 自动上屏（服务端 + 客
     不占剪贴板、不模拟按键、终端/普通输入框通吃(即输入法第⑤层原生通道)。
     (AT-SPI 仅只读使用: 白名单安全门 + 日志显示目标窗口名)
 
-日常使用:
-    手机浏览器打开 http://<电脑IP>:8765 → 光标放到输入位置 → 说话 → 发送
-
-注意: 不要用 --reload 热重载启动, 会杀掉后台客户端线程
+架构一条线: FastAPI 收文字 → 队列 → 投递线程 → IBus commit → 光标处
 """
 
-import argparse
 import json
 import os
 import queue
@@ -34,31 +32,25 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import parse_qs
 
 try:
-    import requests
     import uvicorn
     from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import HTMLResponse, JSONResponse
 except ImportError as e:
-    print("缺少依赖，请先执行:  pip install fastapi uvicorn requests")
+    print("缺少依赖，请先执行:  pip install fastapi uvicorn")
     print(f"缺的模块: {e}")
     raise SystemExit(1)
 
 # ════════════════════════ 配置区（按需修改）════════════════════════
-URL                 = "http://127.0.0.1:8765"  # 客户端连接服务端的地址，同机就 127.0.0.1
 TOKEN               = "mysecret123"            # 随手改掉，防局域网乱入
 HOST, PORT          = "0.0.0.0", 8765          # 服务端监听地址和端口
-DELAY               = 0.05     # 点「发送」→上屏的缓冲秒数（要留切窗口时间就调大）
+DELAY               = 0.05     # 手机「发送」→上屏的缓冲秒数（要留切窗口时间就调大）
 ALLOWLIST           = None     # 只允许在这些程序里自动上屏（匹配应用名/窗口标题），如 frozenset(["gnome-text-editor", "WPS", "firefox"])
 MAX_TEXT_LEN        = 20000    # 单次推送最大字数，防误发
 AUTO_SWITCH_IME     = False    # True=发送时自动切引擎(commit后切回)；False=只在你停在「语音听写」输入源时才走 commit
 LOCAL_SENSEVOICE_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "models", "asr-sensevoice")  # 本机识别模型(SenseVoice,非流式)
-LOCAL_DENOISER      = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "models", "denoiser", "gtcrn.onnx")   # 降噪模型,存在则识别前自动降噪
-USE_DENOISER        = False    # GTCRN 降噪。实测本机麦克风上会把语音一起压没,默认关;模型留着备选
 MIC_HW_VOLUME       = "40%"    # 录音前强制的硬件增益(实测:40%干净,45-60%死区,100%削波);None=不管理
 # ═════════════════════════════════════════════════════════════════════
 
@@ -67,42 +59,6 @@ IS_LINUX = sys.platform.startswith("linux")
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-
-
-# ════════════════════════ 进程内消息总线 ════════════════════════
-
-class Broker:
-    """/push 发布消息，/stream 订阅消息"""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._subs: set = set()
-
-    def count(self) -> int:
-        with self._lock:
-            return len(self._subs)
-
-    def subscribe(self) -> "queue.Queue":
-        q = queue.Queue(maxsize=100)
-        with self._lock:
-            self._subs.add(q)
-        return q
-
-    def unsubscribe(self, q: "queue.Queue") -> None:
-        with self._lock:
-            self._subs.discard(q)
-
-    def publish(self, msg: dict) -> None:
-        with self._lock:
-            subs = list(self._subs)
-        for q in subs:
-            try:
-                q.put_nowait(msg)
-            except queue.Full:
-                pass  # 订阅方卡死时丢弃，不阻塞推送
-
-
-broker = Broker()
 
 
 # ════════════════════════ 网页 ════════════════════════
@@ -217,9 +173,9 @@ PAGE = """<!doctype html>
   async function checkHealth() {
     try {
       const j = await (await fetch("/health")).json();
-      $("status").textContent = j.clients > 0
+      $("status").textContent = j.ok
         ? "✅ 电脑端已连接，随时可以发送"
-        : "⚠️ 电脑端未连接（电脑上的接收程序没在跑？）";
+        : "⚠️ 电脑端未就绪";
     } catch (e) {
       $("status").textContent = "❌ 连不上服务端";
     }
@@ -239,7 +195,7 @@ PAGE = """<!doctype html>
       });
       const j = await r.json();
       if (r.ok && j.ok) {
-        toast("已发送 " + j.length + " 字" + (j.clients > 0 ? "" : "（但电脑端没在收！）"), j.clients > 0);
+        toast("已发送 " + j.length + " 字");
         localStorage.setItem(lastKey, JSON.stringify({ text: text, at: Date.now() }));
         showLast();
         ta.value = "";
@@ -271,6 +227,9 @@ PAGE = PAGE.replace("__TOKEN__", json.dumps(TOKEN, ensure_ascii=False))
 
 app = FastAPI(title="phone-dictation", docs_url=None, redoc_url=None, openapi_url=None)
 
+# 投递队列:HTTP 线程收文字,主线程取走上屏(进程内,替代原 localhost SSE 回环)
+deliver_q: "queue.Queue" = queue.Queue(maxsize=100)
+
 
 def _token_ok(request: Request) -> bool:
     tok = request.query_params.get("token") or request.headers.get("x-token", "")
@@ -284,7 +243,8 @@ def index():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "clients": broker.count()}
+    # 服务端与投递线程同进程:能应答即表示整条链路活着
+    return {"ok": True, "clients": 1}
 
 
 @app.post("/push")
@@ -293,7 +253,6 @@ async def push(request: Request):
         return JSONResponse({"ok": False, "error": "token 错误"}, status_code=401)
 
     text = request.query_params.get("text", "")
-
     ctype = request.headers.get("content-type", "").lower()
     if not text and "json" in ctype:
         try:
@@ -301,15 +260,6 @@ async def push(request: Request):
             text = str(body.get("text", ""))
         except Exception:
             return JSONResponse({"ok": False, "error": "JSON 解析失败"}, status_code=400)
-    elif not text and "urlencoded" in ctype:
-        # 不用 request.form()：新版 Starlette 解析表单强制依赖 python-multipart，这里用标准库即可
-        try:
-            params = parse_qs((await request.body()).decode("utf-8", "replace"),
-                              keep_blank_values=True)
-            if params.get("text"):
-                text = params["text"][0]
-        except Exception:
-            pass
 
     text = text or ""
     if not text.strip():
@@ -318,38 +268,17 @@ async def push(request: Request):
         return JSONResponse({"ok": False, "error": f"超过单次上限 {MAX_TEXT_LEN} 字"},
                             status_code=413)
 
-    broker.publish({"text": text, "ts": time.time()})
-    return {"ok": True, "length": len(text), "clients": broker.count()}
-
-
-@app.get("/stream")
-def stream(request: Request):
-    if not _token_ok(request):
-        return JSONResponse({"ok": False, "error": "token 错误"}, status_code=401)
-
-    q = broker.subscribe()
-
-    def gen():
-        try:
-            yield "retry: 2000\n\n"
-            yield ": connected\n\n"
-            while True:
-                try:
-                    msg = q.get(timeout=5)
-                    yield "data: " + json.dumps(msg, ensure_ascii=False) + "\n\n"
-                except queue.Empty:
-                    yield ": ping\n\n"   # 心跳，防断连，也让服务端能尽快收尾
-        finally:
-            broker.unsubscribe(q)
-
-    return StreamingResponse(gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache",
-                                      "X-Accel-Buffering": "no"})
+    try:
+        deliver_q.put_nowait(text)
+    except queue.Full:
+        return JSONResponse({"ok": False, "error": "投递队列满，稍后再试"},
+                            status_code=503)
+    return {"ok": True, "length": len(text)}
 
 
 @app.api_route("/local-voice", methods=["GET", "POST"])
 def local_voice(request: Request):
-    """切换本机录音识别(阶段二):快捷键或浏览器触发"""
+    """切换本机录音识别:Alt+V 快捷键或浏览器触发"""
     if not _token_ok(request):
         return JSONResponse({"ok": False, "error": "token 错误"}, status_code=401)
     if not IS_LINUX:
@@ -362,7 +291,7 @@ def run_server(block: bool = True):
     if block:
         uvicorn.run(app, host=HOST, port=PORT, log_level="info", access_log=False)
         return None
-    # 合并模式：服务端放后台线程跑
+    # 服务端放后台线程跑
     server = uvicorn.Server(uvicorn.Config(app, host=HOST, port=PORT,
                                            log_level="info", access_log=False))
     t = threading.Thread(target=server.run, name="uvicorn", daemon=True)
@@ -380,7 +309,6 @@ def run_server(block: bool = True):
 # AT-SPI 仅只读使用：白名单安全门 + 日志显示目标窗口名；不参与文字写入。
 
 if IS_LINUX:
-    import os
 
     try:
         import gi
@@ -428,7 +356,7 @@ if IS_LINUX:
                 return None
 
             def focused_any(self):
-                """不管可不可编辑，返回当前聚焦的节点（诊断/终端识别用）"""
+                """不管可不可编辑，返回当前聚焦的节点（诊断/白名单用）"""
                 with self._lock:
                     acc = self._focused
                 try:
@@ -541,7 +469,7 @@ if IS_LINUX:
                 + "，焦点识别(AT-SPI) " + ("✅" if _ATSPI_OK else "❌(仅影响日志)"))
 
 
-# ════════════════════════ 客户端 ════════════════════════
+# ════════════════════════ 上屏投递 ════════════════════════
 
 def deliver(text: str) -> None:
     text = str(text or "")
@@ -549,7 +477,7 @@ def deliver(text: str) -> None:
         return
     n = len(text)
     if DELAY > 0:
-        log(f"收到 {n} 字，{DELAY:.1f} 秒后上屏（现在切目标窗口/放光标还来得及）")
+        log(f"收到 {n} 字，{DELAY:.2f} 秒后上屏（现在切目标窗口/放光标还来得及）")
         time.sleep(DELAY)
     else:
         log(f"收到 {n} 字，开始上屏")
@@ -614,10 +542,11 @@ def _commit_with_report(text: str, n: int) -> bool:
     return False
 
 
-# ════════════════════════ 本机语音识别(sherpa-onnx,阶段二) ════════════════════════
+# ════════════════════════ 本机语音识别(SenseVoice) ════════════════════════
 
 class _LocalVoice:
-    """快捷键触发 → pw-cat 采 16k 单声道 → 流式识别 → 再按一次结束并 commit"""
+    """快捷键触发 → pw-cat 采 16k 单声道 → 整段缓冲 → 再按一次后
+    SenseVoice 一次性解码 → commit 上屏"""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -627,7 +556,6 @@ class _LocalVoice:
         self._rec = None
         self._so = None
         self._np = None
-        self._dn = None
 
     def _recognizer(self):
         if self._rec is None:
@@ -642,25 +570,6 @@ class _LocalVoice:
                 num_threads=2, use_itn=True, language="zh")
             log("识别引擎: SenseVoice(已加载,常驻)")
         return self._rec
-
-    def _denoiser(self):
-        """GTCRN 神经网络降噪;模型缺失/加载失败则原样直通(三态:None未试/False失败/对象)"""
-        if not USE_DENOISER:
-            return None
-        if self._dn is None:
-            if not os.path.isfile(LOCAL_DENOISER):
-                self._dn = False
-            else:
-                try:
-                    so = self._so or __import__("sherpa_onnx")
-                    g = so.OfflineSpeechDenoiserGtcrnModelConfig(model=LOCAL_DENOISER)
-                    self._dn = so.OnlineSpeechDenoiser(so.OnlineSpeechDenoiserConfig(
-                        model=so.OfflineSpeechDenoiserModelConfig(gtcrn=g)))
-                    log("降噪器已就绪(GTCRN,识别前自动降噪)")
-                except Exception as e:
-                    log(f"降噪器加载失败,本次不降噪: {e}")
-                    self._dn = False
-        return self._dn or None
 
     def toggle(self):
         with self.lock:
@@ -681,11 +590,8 @@ class _LocalVoice:
             return True, "开始录音，再按一次结束"
 
     def _run(self):
-        np, so, rec = self._np, self._so, self._rec
-        dn = self._denoiser()
-        if dn is not None:
-            dn.reset()   # 每次录音从干净状态开始
-        raw_buf, dn_buf = [], []   # 调试转储:原始/降噪后音频
+        np = self._np
+        audio = []   # 整段采集缓冲
         # 硬件增益自愈:WirePlumber 偶发把它顶回 100% 导致削波,每次录音前强制拉回
         if MIC_HW_VOLUME and shutil.which("amixer"):
             try:
@@ -701,49 +607,37 @@ class _LocalVoice:
         except Exception as e:
             log(f"启动采集失败: {e}")
             return
-        log("🎙 本机录音中…(再触发一次结束)" + (" [已降噪]" if dn else ""))
+        log("🎙 本机录音中…(再触发一次结束)")
         try:
             while not self.stop_flag:
                 data = self.proc.stdout.read(3200)   # 0.1s 的 s16 单声道
                 if not data:
                     break
-                samples = np.frombuffer(data, dtype=np.int16) \
-                    .astype(np.float32) / 32768.0
-                raw_buf.append(samples.copy())
-                if dn is not None:
-                    samples = np.asarray(dn.run(samples, 16000).samples,
-                                         dtype=np.float32)
-                    if len(samples) == 0:
-                        continue   # 降噪器内部攒帧,这次没吐出数据
-                dn_buf.append(samples.copy())
+                audio.append(np.frombuffer(data, dtype=np.int16)
+                             .astype(np.float32) / 32768.0)
         finally:
             try:
                 self.proc.kill()
             except Exception:
                 pass
-        # 调试转储:留最近一次的原始/降噪音频,排查"没听清"用
+        # 调试转储:留最近一次音频,排查"没听清"用
         try:
             import wave as _wave
-            for tag, buf in (("raw", raw_buf), ("dn", dn_buf)):
-                if buf:
-                    pcm = np.clip(np.concatenate(buf) * 32767, -32767, 32767) \
-                        .astype("<i2")
-                    with _wave.open(f"/tmp/voicedict_last_{tag}.wav", "wb") as w:
-                        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
-                        w.writeframes(pcm.tobytes())
+            pcm = np.clip(np.concatenate(audio) * 32767, -32767, 32767) \
+                .astype("<i2") if audio else b""
+            if len(pcm):
+                with _wave.open("/tmp/voicedict_last.wav", "wb") as w:
+                    w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+                    w.writeframes(pcm.tobytes())
         except Exception:
             pass
         # 非流式:整段音频一次性解码(实测约 0.15x 实时,10 秒话音约 1.5 秒)
         text = ""
         try:
             log("识别中…")
-            if dn is not None:
-                tail = np.asarray(dn.flush().samples, dtype=np.float32)
-                if len(tail):
-                    dn_buf.append(tail)
-            st = rec.create_stream()
-            st.accept_waveform(16000, np.concatenate(dn_buf or raw_buf))
-            rec.decode_stream(st)
+            st = self._rec.create_stream()
+            st.accept_waveform(16000, np.concatenate(audio))
+            self._rec.decode_stream(st)
             text = st.result.text
         except Exception as e:
             log(f"SenseVoice 解码失败: {e}")
@@ -767,10 +661,7 @@ def _ensure_local_voice():
 def _preload_asr():
     """服务启动时后台加载模型,首次按键零等待"""
     try:
-        lv = _ensure_local_voice()
-        lv._recognizer()
-        if USE_DENOISER and os.path.isfile(LOCAL_DENOISER):
-            lv._denoiser()
+        _ensure_local_voice()._recognizer()
         log("识别模型预加载完成,快捷键即时可用")
     except Exception as e:
         log(f"识别模型预加载失败: {e}")
@@ -781,48 +672,17 @@ def _local_voice_toggle():
     return _ensure_local_voice().toggle()
 
 
-_http = requests.Session()
-_http.trust_env = False   # 无视系统代理，避免本机回环连接被代理软件截走
+# ════════════════════════ 投递线程(主线程) ════════════════════════
 
-
-def client_loop() -> None:
-    if IS_LINUX:
-        log(f"上屏通道: {_linux_backend_summary()}")
-        if os.path.isdir(LOCAL_SENSEVOICE_DIR):
-            dn = " +降噪" if (USE_DENOISER and os.path.isfile(LOCAL_DENOISER)) else ""
-            log(f"本机识别: 模型就绪{dn}(快捷键或 /local-voice 触发)")
-            threading.Thread(target=_preload_asr, daemon=True,
-                             name="asr-preload").start()
-        else:
-            log("本机识别: 未装模型,仅手机通道")
-    else:
-        log("警告：当前不是 Linux，无法上屏，仅接收显示")
-    log(f"客户端就绪，正在连接 {URL}/stream")
+def deliver_loop() -> None:
+    """从队列取文字→上屏;替代原"客户端经 localhost SSE 订阅自己"的回环"""
+    log("投递线程就绪，等待文字……")
     while True:
+        text = deliver_q.get()
         try:
-            with _http.get(f"{URL}/stream", params={"token": TOKEN},
-                           stream=True, timeout=(5, None)) as r:
-                if r.status_code != 200:
-                    log(f"连接被拒（HTTP {r.status_code}，token 对吗？），3 秒后重试")
-                    time.sleep(3)
-                    continue
-                log("客户端已连接，等待手机发送文字……")
-                for raw in r.iter_lines():
-                    if not raw:
-                        continue
-                    line = raw.decode("utf-8", "replace").rstrip("\r")
-                    if not line.startswith("data:"):
-                        continue   # 忽略心跳/注释行
-                    try:
-                        msg = json.loads(line[5:].strip())
-                    except Exception:
-                        continue
-                    deliver(str(msg.get("text", "")))
-        except KeyboardInterrupt:
-            raise
+            deliver(str(text))
         except Exception as e:
-            log(f"与服务端断开（{e}），2 秒后重连")
-            time.sleep(2)
+            log(f"投递异常: {e}")
 
 
 # ════════════════════════ 入口 ════════════════════════
@@ -848,22 +708,17 @@ def lan_ips():
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="手机语音听写 → 电脑上屏（服务端+客户端合一）")
-    g = ap.add_mutually_exclusive_group()
-    g.add_argument("--server-only", action="store_true", help="只启动网页/推送服务（排查用）")
-    g.add_argument("--client-only", action="store_true", help="只启动接收上屏客户端（排查用）")
-    args = ap.parse_args()
+    if IS_LINUX:
+        log(f"上屏通道: {_linux_backend_summary()}")
+        if os.path.isdir(LOCAL_SENSEVOICE_DIR):
+            log("本机识别: 模型就绪(Alt+V 或 /local-voice 触发)")
+            threading.Thread(target=_preload_asr, daemon=True,
+                             name="asr-preload").start()
+        else:
+            log("本机识别: 未装模型,仅手机通道")
+    else:
+        log("警告：当前不是 Linux，无法上屏，仅接收显示")
 
-    if args.server_only:
-        log(f"仅服务端模式 http://{HOST}:{PORT}")
-        run_server(block=True)
-        return
-    if args.client_only:
-        log("仅客户端模式")
-        client_loop()
-        return
-
-    # 合并模式：服务端后台线程 + 主线程跑客户端（Ctrl+C 即退出）
     try:
         run_server(block=False)
     except Exception as e:
@@ -872,7 +727,7 @@ def main() -> None:
     log(f"服务端启动 http://{HOST}:{PORT}")
     for ip in lan_ips():
         log(f"手机浏览器访问 http://{ip}:{PORT}")
-    client_loop()
+    deliver_loop()   # 主线程常驻:取队列→上屏
 
 
 if __name__ == "__main__":

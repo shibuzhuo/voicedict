@@ -61,12 +61,10 @@ ALLOWLIST        = None           # 只允许在指定程序上屏,如 frozenset
 MAX_TEXT_LEN     = 20000          # 单次推送上限
 AUTO_SWITCH_IME  = False          # True=发送时自动切引擎 commit 后切回
 LOCAL_SENSEVOICE_DIR = .../models/asr-sensevoice   # 识别模型目录,存在才启用
-USE_DENOISER     = False          # GTCRN 降噪(实验性):实测部分内置麦克风会把语音一起压没,默认关
 MIC_HW_VOLUME    = "40%"          # 录音前强制的硬件增益(实测本机:40%干净/45-60%死区/100%削波)
 ```
 
-排查"没听清":每次录音自动转储 `/tmp/voicedict_last_raw.wav`(原始)和
-`/tmp/voicedict_last_dn.wav`(降噪后),直接 pw-play 听或喂 ASR 对比。
+排查"没听清":每次录音自动转储 `/tmp/voicedict_last.wav`,pw-play 试听确认采集正常。
 
 改完 `systemctl --user restart dictation` 生效。
 
